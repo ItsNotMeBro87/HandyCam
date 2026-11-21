@@ -1,0 +1,1197 @@
+diff --git a/.github/workflows/build-apk.yml b/.github/workflows/build-apk.yml
+new file mode 100644
+index 0000000..203fe65
+--- /dev/null
++++ b/.github/workflows/build-apk.yml
+@@ -0,0 +1,113 @@
++name: Build APK
++
++# Builds an installable APK without needing Android Studio.
++# Run it from the "Actions" tab -> "Build APK" -> "Run workflow", or it runs on every push.
++# When it finishes, download the APK from the "Artifacts" section of the run page.
++
++on:
++  push:
++    branches: [main, master, dev]
++  pull_request:
++  workflow_dispatch:
++
++permissions:
++  contents: read
++
++concurrency:
++  group: build-apk-${{ github.ref }}
++  cancel-in-progress: true
++
++jobs:
++  build:
++    name: Build APK
++    runs-on: ubuntu-latest
++    timeout-minutes: 45
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v5
++
++      - name: Set up JDK 17
++        uses: actions/setup-java@v5
++        with:
++          distribution: temurin
++          java-version: '17'
++
++      - name: Set up Gradle
++        uses: gradle/actions/setup-gradle@v4
++
++      - name: Make gradlew executable
++        run: chmod +x gradlew
++
++      # --- Signing ---------------------------------------------------------------
++      # Android only installs signed APKs. If you add the four repository secrets
++      # (ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS,
++      # ANDROID_KEY_PASSWORD) the APK is signed with YOUR key, so every build can be
++      # installed over the previous one. Without secrets a throw-away key is used
++      # (fine for testing, but you must uninstall the old build before installing a new one).
++      - name: Set up signing key
++        env:
++          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
++          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
++          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
++          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
++        run: |
++          if [ -n "$ANDROID_KEYSTORE_BASE64" ] && [ -n "$ANDROID_KEYSTORE_PASSWORD" ] && [ -n "$ANDROID_KEY_ALIAS" ] && [ -n "$ANDROID_KEY_PASSWORD" ]; then
++            echo "Using your signing key from repository secrets."
++            base64 -d <<< "$ANDROID_KEYSTORE_BASE64" > "$RUNNER_TEMP/keystore.jks"
++            {
++              echo "storeFile=$RUNNER_TEMP/keystore.jks"
++              echo "storePassword=$ANDROID_KEYSTORE_PASSWORD"
++              echo "keyAlias=$ANDROID_KEY_ALIAS"
++              echo "keyPassword=$ANDROID_KEY_PASSWORD"
++            } > keystore.properties
++          else
++            echo "::notice::No signing secrets found - using a temporary debug key. Uninstall the previous build before installing a new one."
++            mkdir -p ~/.android
++            keytool -genkeypair -v -keystore ~/.android/debug.keystore \
++              -storepass android -keypass android -alias androiddebugkey \
++              -keyalg RSA -keysize 2048 -validity 10000 \
++              -dname "CN=Android Debug,O=Android,C=US"
++          fi
++
++      - name: Build release APK
++        run: ./gradlew :app:assembleRelease --stacktrace
++
++      - name: Rename APK
++        run: |
++          APK=$(find app/build/outputs/apk/release -name '*.apk' -type f | head -1)
++          [ -n "$APK" ] || { echo "APK not found" >&2; exit 1; }
++          mkdir -p dist
++          cp "$APK" "dist/HandyCam-android5-${GITHUB_SHA::7}.apk"
++
++      - name: Upload APK
++        uses: actions/upload-artifact@v4
++        with:
++          name: HandyCam-APK
++          path: dist/*.apk
++          if-no-files-found: error
++
++  # Optional extra checks. They never fail the run; the reports just help you spot
++  # code that might not work on old Android versions ("NewApi" findings).
++  lint:
++    name: Lint report (informational)
++    runs-on: ubuntu-latest
++    timeout-minutes: 45
++    continue-on-error: true
++    steps:
++      - uses: actions/checkout@v5
++      - uses: actions/setup-java@v5
++        with:
++          distribution: temurin
++          java-version: '17'
++      - uses: gradle/actions/setup-gradle@v4
++      - run: chmod +x gradlew
++      - name: Run lint
++        run: ./gradlew :app:lintDebug --continue
++        continue-on-error: true
++      - name: Upload lint report
++        uses: actions/upload-artifact@v4
++        if: always()
++        with:
++          name: lint-report
++          path: app/build/reports/lint-results-debug.html
++          if-no-files-found: ignore
+diff --git a/README.md b/README.md
+index 6e223b3..25b9fb5 100644
+--- a/README.md
++++ b/README.md
+@@ -41,6 +41,12 @@ Android APKs are published to every release, and [Obtainium](https://obtainium.i
+ 
+ 
+ ## Compatibility
++**This fork runs on Android 5.0 (API 21) and newer.** Notes for older phones:
++- Streaming the screen with *device audio* needs Android 10+. On older versions the microphone is streamed instead.
++- HDR needs Android 13+. Multi-lens/physical-camera selection needs Android 9+. High frame rates (>60 fps) need Android 6+.
++- Some Android 5/6 phones only have "LEGACY" Camera2 support. If H.264 gives an error, try **MJPEG** at a lower resolution (e.g. 640x480 / 720p).
++- The HTTP control server is a small built-in server (no Ktor/Netty) so it works on old Android versions.
++
+ HDR requires Android 13 or newer, an HLG10-capable camera, and a compatible HEVC Main10 encoder at the chosen settings. Camera preview and screen capture are unavailable in HDR mode.
+ > [!IMPORTANT]
+ > The FPS selection is an approximation and can be wrong, especially when using custom resolutions!
+@@ -56,6 +62,17 @@ Please report and device incompatibilities in the [Discussions](https://github.c
+ - Squash Bugs
+ 
+ ## Build Instructions
++### Without Android Studio (GitHub Actions)
++1. Push this repo to your GitHub fork.
++2. Open the **Actions** tab, pick **Build APK**, and click **Run workflow** (it also runs on every push).
++3. When it finishes, open the run and download **HandyCam-APK** from *Artifacts* (a zip containing the `.apk`).
++4. Optional but recommended: add the repository secrets `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`,
++   `ANDROID_KEY_ALIAS` and `ANDROID_KEY_PASSWORD` so every build is signed with your own key and can be installed
++   over the previous one. Without them a throw-away key is used (uninstall the old build before installing a new one).
++
++The original Nightly/Release/CodeQL/Appknox workflows need the upstream project's secrets; you can disable them in your fork.
++
++### With Android Studio / local Gradle
+ The easiest way to get going is to download and install [Android Studio](https://developer.android.com/studio) and use its inbuilt Version Control to clone/fork the HandyCam Repository. This should just work out of the box. Alternatively, you can use an IDE like VSCode and download the Android and JAVA JDKs separately. Then you need to point your system to them, for example:
+ 
+ ```
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index c81c84f..695a9a9 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -30,7 +30,7 @@ android {
+ 
+     defaultConfig {
+         applicationId = "com.example.handycam"
+-        minSdk = 29
++        minSdk = 21
+         targetSdk = 36
+         // Version is stamped by CI from the release tag / nightly build. Falls back
+         // to sensible defaults for local builds.
+@@ -89,6 +89,12 @@ android {
+     buildFeatures {
+         compose = true
+     }
++
++    // Lint is informational here: the build must not fail because of it. CI uploads the report.
++    lint {
++        abortOnError = false
++        checkReleaseBuilds = false
++    }
+ }
+ 
+ // UTP runs in separate configurations from the app and its Netty BOM.
+@@ -183,14 +189,9 @@ dependencies {
+     // Compose Foundation (HorizontalPager, TabRow) — included via BOM
+     implementation(libs.androidx.compose.material.icons.extended)
+     
+-    // HTTP control server
+-    // Align Netty modules to a release containing the TLS and IP filter fixes.
+-    implementation(platform(libs.netty.bom))
+-    implementation(libs.ktor.server.core)
+-    implementation(libs.ktor.server.netty)
+-    implementation(libs.ktor.server.content.negotiation)
+-    implementation(libs.ktor.serialization.kotlinx.json)
+-    
++    // JSON for the built-in HTTP control server (no Ktor/Netty: they need newer Android)
++    implementation(libs.kotlinx.serialization.json)
++
+     testImplementation(libs.junit)
+     androidTestImplementation(libs.androidx.junit)
+     androidTestImplementation(libs.androidx.espresso.core)
+diff --git a/app/src/main/java/com/example/handycam/ApiCompat.kt b/app/src/main/java/com/example/handycam/ApiCompat.kt
+new file mode 100644
+index 0000000..d143b86
+--- /dev/null
++++ b/app/src/main/java/com/example/handycam/ApiCompat.kt
+@@ -0,0 +1,209 @@
++package com.example.handycam
++
++import android.annotation.SuppressLint
++import android.hardware.camera2.CameraCaptureSession
++import android.hardware.camera2.CameraCharacteristics
++import android.hardware.camera2.CameraConstrainedHighSpeedCaptureSession
++import android.hardware.camera2.CameraDevice
++import android.hardware.camera2.CaptureRequest
++import android.hardware.camera2.params.DynamicRangeProfiles
++import android.hardware.camera2.params.OutputConfiguration
++import android.hardware.camera2.params.SessionConfiguration
++import android.media.AudioAttributes
++import android.media.AudioFormat
++import android.media.AudioPlaybackCaptureConfiguration
++import android.media.AudioRecord
++import android.media.MediaCodecInfo
++import android.media.MediaFormat
++import android.media.projection.MediaProjection
++import android.os.Build
++import android.os.Handler
++import android.view.Surface
++import androidx.annotation.RequiresApi
++import java.util.concurrent.Executor
++
++/**
++ * Wrappers around platform APIs that are newer than Android 5.0 (API 21).
++ *
++ * Every API-level specific class lives in its own nested object so that the classes that are
++ * missing on an old device are only ever loaded on devices that actually have them.
++ * StreamService calls these helpers instead of touching the new classes directly.
++ */
++internal object ApiCompat {
++
++    // ---------------------------------------------------------------- Camera2 sessions
++
++    /**
++     * Creates a Camera2 capture session with the best API available on this device:
++     *  - API 28+: SessionConfiguration (physical lens ids, session parameters, HDR profile)
++     *  - API 23-27: createConstrainedHighSpeedCaptureSession / createCaptureSession(List)
++     *  - API 21-22: createCaptureSession(List)
++     */
++    @Suppress("DEPRECATION")
++    fun createCaptureSession(
++        camera: CameraDevice,
++        surfaces: List<Surface>,
++        highSpeed: Boolean,
++        physicalCameraId: String?,
++        hdrSurface: Surface?,
++        sessionParameters: CaptureRequest?,
++        callback: CameraCaptureSession.StateCallback,
++        handler: Handler?
++    ) {
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
++            Api28.createSession(
++                camera, surfaces, highSpeed, physicalCameraId, hdrSurface,
++                sessionParameters, callback, handler
++            )
++            return
++        }
++        if (highSpeed) {
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
++                Api23.createHighSpeedSession(camera, surfaces, callback, handler)
++                return
++            }
++            throw IllegalStateException("High frame rate capture needs Android 6.0 or newer")
++        }
++        camera.createCaptureSession(surfaces, callback, handler)
++    }
++
++    /** Submits a repeating request, using burst mode for constrained high-speed sessions. */
++    fun submitRepeating(session: CameraCaptureSession, request: CaptureRequest, handler: Handler?) {
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
++            Api23.submitHighSpeedRepeating(session, request, handler)
++        ) {
++            return
++        }
++        session.setRepeatingRequest(request, null, handler)
++    }
++
++    // ---------------------------------------------------------------- HDR (Android 13+)
++
++    fun supportsHlg10(chars: CameraCharacteristics): Boolean =
++        Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && Api33.supportsHlg10(chars)
++
++    fun enableHdrEditing(format: MediaFormat) {
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
++            Api29.enableHdrEditing(format)
++        }
++    }
++
++    // ---------------------------------------------------------------- Device audio (Android 10+)
++
++    /** Whether "stream device audio while casting the screen" is possible on this device. */
++    val supportsPlaybackCapture: Boolean
++        get() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
++
++    /** Only call when [supportsPlaybackCapture] is true. */
++    fun createPlaybackCaptureRecord(
++        projection: MediaProjection,
++        sampleRate: Int,
++        channelMask: Int,
++        bufferSize: Int
++    ): AudioRecord {
++        check(supportsPlaybackCapture) { "Device audio capture needs Android 10" }
++        return Api29.createPlaybackCaptureRecord(projection, sampleRate, channelMask, bufferSize)
++    }
++
++    // ================================================================ per-API holders
++
++    @RequiresApi(Build.VERSION_CODES.P)
++    private object Api28 {
++        fun createSession(
++            camera: CameraDevice,
++            surfaces: List<Surface>,
++            highSpeed: Boolean,
++            physicalCameraId: String?,
++            hdrSurface: Surface?,
++            sessionParameters: CaptureRequest?,
++            callback: CameraCaptureSession.StateCallback,
++            handler: Handler?
++        ) {
++            val outputs = surfaces.map { surface ->
++                OutputConfiguration(surface).also { output ->
++                    if (physicalCameraId != null) output.setPhysicalCameraId(physicalCameraId)
++                    if (hdrSurface != null && surface == hdrSurface &&
++                        Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
++                    ) {
++                        Api33.applyHlg10(output)
++                    }
++                }
++            }
++            val type = if (highSpeed) SessionConfiguration.SESSION_HIGH_SPEED
++            else SessionConfiguration.SESSION_REGULAR
++            val executor = Executor { command -> handler?.post(command) }
++            val config = SessionConfiguration(type, outputs, executor, callback)
++            if (sessionParameters != null) config.setSessionParameters(sessionParameters)
++            camera.createCaptureSession(config)
++        }
++    }
++
++    @RequiresApi(Build.VERSION_CODES.M)
++    private object Api23 {
++        fun createHighSpeedSession(
++            camera: CameraDevice,
++            surfaces: List<Surface>,
++            callback: CameraCaptureSession.StateCallback,
++            handler: Handler?
++        ) {
++            camera.createConstrainedHighSpeedCaptureSession(surfaces, callback, handler)
++        }
++
++        /** Returns true if [session] was a high-speed session and the request was submitted. */
++        fun submitHighSpeedRepeating(
++            session: CameraCaptureSession,
++            request: CaptureRequest,
++            handler: Handler?
++        ): Boolean {
++            if (session is CameraConstrainedHighSpeedCaptureSession) {
++                session.setRepeatingBurst(session.createHighSpeedRequestList(request), null, handler)
++                return true
++            }
++            return false
++        }
++    }
++
++    @RequiresApi(Build.VERSION_CODES.Q)
++    private object Api29 {
++        fun enableHdrEditing(format: MediaFormat) {
++            format.setFeatureEnabled(MediaCodecInfo.CodecCapabilities.FEATURE_HdrEditing, true)
++        }
++
++        @SuppressLint("MissingPermission")
++        fun createPlaybackCaptureRecord(
++            projection: MediaProjection,
++            sampleRate: Int,
++            channelMask: Int,
++            bufferSize: Int
++        ): AudioRecord {
++            val config = AudioPlaybackCaptureConfiguration.Builder(projection)
++                .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
++                .addMatchingUsage(AudioAttributes.USAGE_GAME)
++                .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
++                .build()
++            return AudioRecord.Builder()
++                .setAudioPlaybackCaptureConfig(config)
++                .setAudioFormat(
++                    AudioFormat.Builder()
++                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
++                        .setSampleRate(sampleRate)
++                        .setChannelMask(channelMask)
++                        .build()
++                )
++                .setBufferSizeInBytes(bufferSize)
++                .build()
++        }
++    }
++
++    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
++    private object Api33 {
++        fun supportsHlg10(chars: CameraCharacteristics): Boolean {
++            val profiles = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES)
++            return profiles?.supportedProfiles?.contains(DynamicRangeProfiles.HLG10) == true
++        }
++
++        fun applyHlg10(output: OutputConfiguration) {
++            output.setDynamicRangeProfile(DynamicRangeProfiles.HLG10)
++        }
++    }
++}
+diff --git a/app/src/main/java/com/example/handycam/KtorHttpServerService.kt b/app/src/main/java/com/example/handycam/KtorHttpServerService.kt
+index 1663c49..488db3d 100644
+--- a/app/src/main/java/com/example/handycam/KtorHttpServerService.kt
++++ b/app/src/main/java/com/example/handycam/KtorHttpServerService.kt
+@@ -16,15 +16,12 @@ import com.example.handycam.data.model.api.CameraListItem
+ import com.example.handycam.data.model.api.CameraStatusResponse
+ import com.example.handycam.data.model.api.ServerInfo
+ import com.example.handycam.data.model.api.ServerStatus
+-import io.ktor.server.engine.*
+-import io.ktor.server.netty.*
+-import io.ktor.server.application.*
+-import io.ktor.server.response.*
+-import io.ktor.server.routing.*
+-import io.ktor.http.*
+-import io.ktor.serialization.kotlinx.json.*
+-import io.ktor.server.plugins.contentnegotiation.*
+-import io.ktor.server.request.*
++import com.example.handycam.http.ContentType
++import com.example.handycam.http.HttpStatusCode
++import com.example.handycam.http.MiniHttpServer
++import com.example.handycam.http.Routing
++import com.example.handycam.http.routing
++import androidx.core.app.ServiceCompat
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.launch
+ import android.hardware.camera2.CameraCharacteristics
+@@ -37,13 +34,14 @@ private const val CHANNEL_ID = "ktor_https_server"
+ private const val NOTIF_ID = 2001
+ 
+ /**
+- * Foreground service that runs a Ktor HTTP server.
+- * The server runs on a specified port.
++ * Foreground service that runs the HTTP control server (web UI + REST API).
++ * The server runs on a specified port. It uses the small built-in [MiniHttpServer]
++ * instead of Ktor/Netty so it works on Android 5.0 and newer.
+  */
+ @dagger.hilt.android.AndroidEntryPoint
+ class KtorHttpServerService : LifecycleService() {
+     
+-    private var server: EmbeddedServer<NettyApplicationEngine, NettyApplicationEngine.Configuration>? = null
++    private var server: MiniHttpServer? = null
+     private var httpPort = 8080
+     private var isRunning = false
+     @javax.inject.Inject lateinit var streamStateHolder: com.example.handycam.service.StreamStateHolder
+@@ -69,7 +67,7 @@ class KtorHttpServerService : LifecycleService() {
+             }
+             HttpServerActions.STOP -> {
+                 stopHttpServer()
+-                stopForeground(STOP_FOREGROUND_REMOVE)
++                ServiceCompat.stopForeground(this@KtorHttpServerService, ServiceCompat.STOP_FOREGROUND_REMOVE)
+                 stopSelf()
+             }
+         }
+@@ -82,6 +80,11 @@ class KtorHttpServerService : LifecycleService() {
+         return null
+     }
+ 
++    /** The launcher foreground vector uses a gradient, which only renders on API 24+. */
++    private fun smallIconRes(): Int =
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) R.drawable.ic_launcher_foreground
++        else R.drawable.ic_flash
++
+     private fun createNotificationChannel() {
+             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+             val channel = NotificationChannel(
+@@ -120,9 +123,9 @@ class KtorHttpServerService : LifecycleService() {
+         NotificationCompat.Builder(this, CHANNEL_ID)
+             .setContentTitle("HTTP Server")
+             .setContentText(text)
+-            .setSmallIcon(R.drawable.ic_launcher_foreground)
++            .setSmallIcon(smallIconRes())
+             .setContentIntent(openPending)
+-            .addAction(R.drawable.ic_launcher_foreground, "Stop", stopPending)
++            .addAction(smallIconRes(), "Stop", stopPending)
+             .setOngoing(true)
+             .build()
+     }
+@@ -137,9 +140,7 @@ class KtorHttpServerService : LifecycleService() {
+                 // startTime = System.currentTimeMillis()
+ 
+                 // Run a plain HTTP server (no TLS/keystore) for local control
+-                server = embeddedServer(Netty, port = httpPort) {
+-                    configureRouting()
+-                }.apply { start(wait = false) }
++                server = MiniHttpServer(httpPort, buildRouting(), lifecycleScope).also { it.start() }
+ 
+                 isRunning = true
+ 
+@@ -168,12 +169,8 @@ class KtorHttpServerService : LifecycleService() {
+         }
+     }
+ 
+-    private fun Application.configureRouting() {
+-        install(ContentNegotiation) {
+-            json()
+-        }
+-        
+-        routing {
++    private fun buildRouting(): Routing {
++        return routing {
+             get("/") {
+                 call.respondText(
+                     homePageHtml,
+@@ -307,7 +304,7 @@ class KtorHttpServerService : LifecycleService() {
+                         val notif = NotificationCompat.Builder(this@KtorHttpServerService, notifChannelId)
+                             .setContentTitle("HandyCam: Action Required")
+                             .setContentText("Tap to open app and start streaming")
+-                            .setSmallIcon(R.drawable.ic_launcher_foreground)
++                            .setSmallIcon(smallIconRes())
+                             .setPriority(NotificationCompat.PRIORITY_HIGH)
+                             .setCategory(NotificationCompat.CATEGORY_CALL)
+                             .setContentIntent(openPending)
+@@ -630,7 +627,7 @@ class KtorHttpServerService : LifecycleService() {
+ 
+     private fun stopHttpServer() {
+         try {
+-            server?.stop(1000, 2000)
++            server?.stop()
+             server = null
+             isRunning = false
+             Log.i(TAG, "HTTP Server stopped")
+diff --git a/app/src/main/java/com/example/handycam/MainActivity.kt b/app/src/main/java/com/example/handycam/MainActivity.kt
+index b8f3193..6e428fe 100644
+--- a/app/src/main/java/com/example/handycam/MainActivity.kt
++++ b/app/src/main/java/com/example/handycam/MainActivity.kt
+@@ -99,7 +99,7 @@ class MainActivity : ComponentActivity() {
+             putExtra("avcBitrate", mainViewModel.streamStateHolder.avcBitrate.value)
+         }
+         try {
+-            startForegroundService(intent)
++            androidx.core.content.ContextCompat.startForegroundService(this, intent)
+             Log.i(TAG, "Started deferred remote stream request on resume")
+         } catch (e: Exception) {
+             Log.e(TAG, "Failed to start deferred remote stream", e)
+diff --git a/app/src/main/java/com/example/handycam/PhysicalLens.kt b/app/src/main/java/com/example/handycam/PhysicalLens.kt
+index 53d4fef..623e940 100644
+--- a/app/src/main/java/com/example/handycam/PhysicalLens.kt
++++ b/app/src/main/java/com/example/handycam/PhysicalLens.kt
+@@ -17,6 +17,8 @@ object PhysicalLens {
+     }
+ 
+     fun valid(manager: CameraManager, key: String): Boolean = try {
++        // Physical (multi-camera) lenses only exist on Android 9+.
++        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.P) return false
+         val pair = parse(key) ?: return false
+         pair.first in manager.cameraIdList &&
+             pair.second in manager.getCameraCharacteristics(pair.first).physicalCameraIds
+diff --git a/app/src/main/java/com/example/handycam/StreamService.kt b/app/src/main/java/com/example/handycam/StreamService.kt
+index bf77e4f..3fc8b92 100644
+--- a/app/src/main/java/com/example/handycam/StreamService.kt
++++ b/app/src/main/java/com/example/handycam/StreamService.kt
+@@ -57,7 +57,7 @@ import android.media.AudioRecord
+ import android.media.AudioFormat
+ import android.media.MediaRecorder
+ import android.media.AudioAttributes
+-import android.media.AudioPlaybackCaptureConfiguration
++import androidx.core.app.ServiceCompat
+ private const val TAG = "StreamService"
+ private const val CHANNEL_ID = "handycam_stream"
+ private const val NOTIF_ID = 1001
+@@ -108,6 +108,9 @@ class StreamService : LifecycleService() {
+     // Must be used as-is when rebuilding CaptureRequests — Camera2 throws if
+     // the set of targets doesn't match the session configuration.
+     private var sessionSurfaces: List<Surface> = emptyList()
++    // Old/LEGACY Camera2 devices often reject a 3rd output stream. When the session with the
++    // extra YUV ImageReader fails, we retry once without it.
++    private var skipImageReaderConsumer = false
+     // CameraX fields for MJPEG path so we can rebind while running
+     private var cameraProvider: ProcessCameraProvider? = null
+     private var analysisUseCase: ImageAnalysis? = null
+@@ -307,7 +310,7 @@ class StreamService : LifecycleService() {
+                     Log.e(TAG, "Unable to start streaming", e)
+                     stopStreaming()
+                     android.widget.Toast.makeText(this, "Unable to start streaming. Check permissions and settings.", android.widget.Toast.LENGTH_LONG).show()
+-                    stopForeground(STOP_FOREGROUND_REMOVE)
++                    ServiceCompat.stopForeground(this@StreamService, ServiceCompat.STOP_FOREGROUND_REMOVE)
+                     stopSelf()
+                     return START_NOT_STICKY
+                 }
+@@ -342,7 +345,7 @@ class StreamService : LifecycleService() {
+                 streamStateHolder.setStreaming(false)
+                 unregisterMdns()
+                 stopStreaming()
+-                stopForeground(STOP_FOREGROUND_REMOVE)
++                ServiceCompat.stopForeground(this@StreamService, ServiceCompat.STOP_FOREGROUND_REMOVE)
+                 stopSelf()
+             }
+             else -> {
+@@ -658,6 +661,7 @@ class StreamService : LifecycleService() {
+         targetFps = fps
+         useAvc = useAvcFlag
+         highSpeedCameraSession = false
++        skipImageReaderConsumer = false
+         useScreenCapture = screenCapture
+ 
+         if (useScreenCapture) {
+@@ -879,7 +883,7 @@ class StreamService : LifecycleService() {
+     // ── Screen capture helpers ──────────────────────────────────────────────
+ 
+     private fun startScreenCaptureMjpeg(resultCode: Int, data: Intent, w: Int, h: Int) {
+-        val mgr = getSystemService(MediaProjectionManager::class.java)
++        val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+         mediaProjection = mgr.getMediaProjection(resultCode, data)
+ 
+         val density = resources.displayMetrics.densityDpi
+@@ -944,7 +948,7 @@ class StreamService : LifecycleService() {
+     }
+ 
+     private fun startScreenCaptureAvc(resultCode: Int, data: Intent) {
+-        val mgr = getSystemService(MediaProjectionManager::class.java)
++        val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+         mediaProjection = mgr.getMediaProjection(resultCode, data)
+ 
+         val density = resources.displayMetrics.densityDpi
+@@ -1007,7 +1011,7 @@ class StreamService : LifecycleService() {
+                 setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT2020)
+                 setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
+                 setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_HLG)
+-                setFeatureEnabled(MediaCodecInfo.CodecCapabilities.FEATURE_HdrEditing, true)
++                ApiCompat.enableHdrEditing(this)
+             }
+             try {
+                 // CBR keeps bitrate predictable so the frame queue doesn't burst-overflow
+@@ -1267,7 +1271,7 @@ class StreamService : LifecycleService() {
+     private fun startAudio() {
+         if (audioRunning) return
+         try {
+-            val deviceAudio = useScreenCapture && mediaProjection != null
++            val deviceAudio = useScreenCapture && mediaProjection != null && ApiCompat.supportsPlaybackCapture
+             val channelConfig = if (deviceAudio) AudioFormat.CHANNEL_IN_STEREO else AudioFormat.CHANNEL_IN_MONO
+             val channelCount = if (deviceAudio) 2 else AUDIO_CHANNELS
+             val minBuf = AudioRecord.getMinBufferSize(
+@@ -1277,22 +1281,9 @@ class StreamService : LifecycleService() {
+             )
+             val bufSize = maxOf(minBuf, 4096)
+             audioRecord = if (deviceAudio) {
+-                val config = AudioPlaybackCaptureConfiguration.Builder(mediaProjection!!)
+-                    .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+-                    .addMatchingUsage(AudioAttributes.USAGE_GAME)
+-                    .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+-                    .build()
+-                AudioRecord.Builder()
+-                    .setAudioPlaybackCaptureConfig(config)
+-                    .setAudioFormat(
+-                        AudioFormat.Builder()
+-                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+-                            .setSampleRate(AUDIO_SAMPLE_RATE)
+-                            .setChannelMask(channelConfig)
+-                            .build()
+-                    )
+-                    .setBufferSizeInBytes(bufSize)
+-                    .build()
++                ApiCompat.createPlaybackCaptureRecord(
++                    mediaProjection!!, AUDIO_SAMPLE_RATE, channelConfig, bufSize
++                )
+             } else {
+                 AudioRecord(
+                     MediaRecorder.AudioSource.MIC,
+@@ -1450,8 +1441,7 @@ class StreamService : LifecycleService() {
+                 throw IllegalStateException("HDR requires Android 13")
+             }
+             val chars = cameraManager!!.getCameraCharacteristics(PhysicalLens.parse(selectedCamera)?.second ?: camId)
+-            val profiles = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES)
+-            check(profiles?.supportedProfiles?.contains(android.hardware.camera2.params.DynamicRangeProfiles.HLG10) == true) { "Camera does not support HLG10" }
++            check(ApiCompat.supportsHlg10(chars)) { "Camera does not support HLG10" }
+         }
+ 
+         // determine a supported output size for the camera for encoder surface
+@@ -1536,7 +1526,16 @@ class StreamService : LifecycleService() {
+                         // create an ImageReader as an additional consumer so some devices
+                         // will happily start streaming into the encoder surface
+                         val targets = mutableListOf(surface)
+-                        if (!highSpeedCameraSession && !useHdr) {
++                        val legacyHardware = try {
++                            cameraManager?.getCameraCharacteristics(camId)
++                                ?.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL) ==
++                                CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_LEGACY
++                        } catch (_: Exception) {
++                            false
++                        }
++                        val addImageReader = !highSpeedCameraSession && !useHdr &&
++                            !skipImageReaderConsumer && !legacyHardware
++                        if (addImageReader) {
+                         val ir = imageReader ?: android.media.ImageReader.newInstance(
+                             chosenWidth.takeIf { it>0 } ?: 1280,
+                             chosenHeight.takeIf { it>0 } ?: 720,
+@@ -1584,22 +1583,36 @@ class StreamService : LifecycleService() {
+ 
+                             override fun onConfigureFailed(session: CameraCaptureSession) {
+                                 Log.e(TAG, "Camera2 session configuration failed")
++                                if (addImageReader && running) {
++                                    // Older cameras often cannot run 3 streams at once: retry
++                                    // once with only the encoder (+ preview) surfaces.
++                                    Log.w(TAG, "Retrying Camera2 session without the extra ImageReader")
++                                    skipImageReaderConsumer = true
++                                    lifecycleScope.launch(Dispatchers.Main) {
++                                        try {
++                                            stopCamera2(releaseEncoderSurface = false)
++                                            startCamera2ToEncoder(requestedWidth, requestedHeight, targetFps)
++                                        } catch (e: Exception) {
++                                            Log.e(TAG, "Retry without ImageReader failed", e)
++                                            failCamera2Switch("Selected lens does not support this stream configuration")
++                                        }
++                                    }
++                                    return
++                                }
+                                 failCamera2Switch("Selected lens does not support this stream configuration")
+                             }
+                         }
+-                        val sessionConfig = android.hardware.camera2.params.SessionConfiguration(
+-                            if (highSpeedCameraSession) android.hardware.camera2.params.SessionConfiguration.SESSION_HIGH_SPEED
+-                            else android.hardware.camera2.params.SessionConfiguration.SESSION_REGULAR,
+-                            targets.map { physicalOutput(it) },
+-                            java.util.concurrent.Executor { cmd -> cameraHandler?.post(cmd) },
+-                            sessionCb
+-                        )
+-                        highFrameRateRange(camera.id)?.let { range ->
++                        val sessionParams = highFrameRateRange(camera.id)?.let { range ->
+                             val parameters = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+                             parameters.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range)
+-                            sessionConfig.setSessionParameters(parameters.build())
++                            parameters.build()
+                         }
+-                        camera.createCaptureSession(sessionConfig)
++                        ApiCompat.createCaptureSession(
++                            camera, targets, highSpeedCameraSession,
++                            PhysicalLens.parse(selectedCamera)?.second,
++                            if (useHdr) encoderInputSurface else null,
++                            sessionParams, sessionCb, cameraHandler
++                        )
+                     } catch (e: Exception) {
+                         Log.e(TAG, "Failed to create capture request/session", e)
+                         failCamera2Switch("Failed to configure selected lens")
+@@ -1678,11 +1691,7 @@ class StreamService : LifecycleService() {
+     }
+ 
+     private fun submitRepeating(session: CameraCaptureSession, request: CaptureRequest) {
+-        if (session is android.hardware.camera2.CameraConstrainedHighSpeedCaptureSession) {
+-            session.setRepeatingBurst(session.createHighSpeedRequestList(request), null, cameraHandler)
+-        } else {
+-            session.setRepeatingRequest(request, null, cameraHandler)
+-        }
++        ApiCompat.submitRepeating(session, request, cameraHandler)
+     }
+ 
+     private fun setInitialLensZoom(selection: String, avc: Boolean) {
+@@ -1721,7 +1730,16 @@ class StreamService : LifecycleService() {
+             Log.i(TAG, "Building selector for camera $cameraId with facing=$targetFacing, focal lengths=$targetFocalLengths")
+             
+             val selectorBuilder = CameraSelector.Builder()
+-            if (physicalId != null) selectorBuilder.setPhysicalCameraId(physicalId)
++            if (physicalId != null) {
++                // Not present in every CameraX release, so look it up at runtime.
++                try {
++                    CameraSelector.Builder::class.java
++                        .getMethod("setPhysicalCameraId", String::class.java)
++                        .invoke(selectorBuilder, physicalId)
++                } catch (e: Exception) {
++                    Log.w(TAG, "CameraX cannot select physical camera $physicalId", e)
++                }
++            }
+             
+             // First, require the correct facing direction
+             when (targetFacing) {
+@@ -1931,14 +1949,6 @@ class StreamService : LifecycleService() {
+         }
+     }
+     
+-    private fun physicalOutput(surface: Surface): android.hardware.camera2.params.OutputConfiguration =
+-        android.hardware.camera2.params.OutputConfiguration(surface).apply {
+-            PhysicalLens.parse(selectedCamera)?.second?.let { setPhysicalCameraId(it) }
+-            if (useHdr && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && surface == encoderInputSurface) {
+-                setDynamicRangeProfile(android.hardware.camera2.params.DynamicRangeProfiles.HLG10)
+-            }
+-        }
+-
+     private fun stopAfterStreamFailure(message: String) {
+         lifecycleScope.launch(Dispatchers.Main) {
+             if (!running) return@launch
+@@ -1946,7 +1956,7 @@ class StreamService : LifecycleService() {
+             unregisterMdns()
+             stopStreaming()
+             android.widget.Toast.makeText(this@StreamService, message, android.widget.Toast.LENGTH_LONG).show()
+-            stopForeground(STOP_FOREGROUND_REMOVE)
++            ServiceCompat.stopForeground(this@StreamService, ServiceCompat.STOP_FOREGROUND_REMOVE)
+             stopSelf()
+         }
+     }
+@@ -2011,19 +2021,17 @@ class StreamService : LifecycleService() {
+                     Log.e(TAG, "Camera2 session reconfigure failed")
+                 }
+             }
+-            val reconfigSessionConfig = android.hardware.camera2.params.SessionConfiguration(
+-                if (highSpeedCameraSession) android.hardware.camera2.params.SessionConfiguration.SESSION_HIGH_SPEED
+-                else android.hardware.camera2.params.SessionConfiguration.SESSION_REGULAR,
+-                surfaces.map { physicalOutput(it) },
+-                java.util.concurrent.Executor { cmd -> cameraHandler?.post(cmd) },
+-                sessionCb2
+-            )
+-            highFrameRateRange(camera.id)?.let { range ->
++            val reconfigParams = highFrameRateRange(camera.id)?.let { range ->
+                 val parameters = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+                 parameters.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range)
+-                reconfigSessionConfig.setSessionParameters(parameters.build())
++                parameters.build()
+             }
+-            camera.createCaptureSession(reconfigSessionConfig)
++            ApiCompat.createCaptureSession(
++                camera, surfaces, highSpeedCameraSession,
++                PhysicalLens.parse(selectedCamera)?.second,
++                null, // HDR never reaches this path (reconfigure returns early for HDR)
++                reconfigParams, sessionCb2, cameraHandler
++            )
+         } catch (e: Exception) {
+             Log.e(TAG, "Error reconfiguring Camera2 session", e)
+         }
+diff --git a/app/src/main/java/com/example/handycam/http/MiniHttpServer.kt b/app/src/main/java/com/example/handycam/http/MiniHttpServer.kt
+new file mode 100644
+index 0000000..de58022
+--- /dev/null
++++ b/app/src/main/java/com/example/handycam/http/MiniHttpServer.kt
+@@ -0,0 +1,283 @@
++package com.example.handycam.http
++
++import android.util.Log
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.launch
++import kotlinx.serialization.KSerializer
++import kotlinx.serialization.json.Json
++import kotlinx.serialization.serializer
++import java.io.BufferedInputStream
++import java.io.ByteArrayOutputStream
++import java.io.IOException
++import java.io.InputStream
++import java.net.InetSocketAddress
++import java.net.ServerSocket
++import java.net.Socket
++
++/*
++ * A deliberately tiny HTTP/1.1 server built on java.net.ServerSocket.
++ *
++ * It replaces Ktor + Netty so the app can run on Android 5.0+ (those libraries rely on
++ * newer JDK/Android APIs). It only needs to serve HandyCam's own web UI and JSON control
++ * API: one request per connection ("Connection: close"), GET/POST, JSON bodies.
++ *
++ * The routing DSL intentionally mirrors the Ktor one that was used before
++ * (routing { get("/x") { call.respond(...) } }) so the route handlers stay unchanged.
++ */
++
++private const val TAG = "MiniHttpServer"
++private const val MAX_HEADER_BYTES = 16 * 1024
++private const val MAX_BODY_BYTES = 1024 * 1024
++
++class HttpStatusCode(val value: Int, val description: String) {
++    companion object {
++        val OK = HttpStatusCode(200, "OK")
++        val BadRequest = HttpStatusCode(400, "Bad Request")
++        val NotFound = HttpStatusCode(404, "Not Found")
++        val Conflict = HttpStatusCode(409, "Conflict")
++        val PayloadTooLarge = HttpStatusCode(413, "Payload Too Large")
++        val InternalServerError = HttpStatusCode(500, "Internal Server Error")
++    }
++}
++
++class ContentType private constructor(val value: String) {
++    object Text {
++        val Html = ContentType("text/html; charset=utf-8")
++        val Plain = ContentType("text/plain; charset=utf-8")
++    }
++
++    object Application {
++        val Json = ContentType("application/json; charset=utf-8")
++    }
++}
++
++private val ApiJson = Json {
++    encodeDefaults = true
++    isLenient = true
++    ignoreUnknownKeys = true
++}
++
++class ResponseHeaders {
++    internal val values = LinkedHashMap<String, String>()
++    fun append(name: String, value: String) {
++        values[name] = value
++    }
++}
++
++class HttpResponse {
++    val headers = ResponseHeaders()
++}
++
++class ApplicationCall internal constructor(
++    val method: String,
++    val path: String,
++    private val bodyText: String
++) {
++    val response = HttpResponse()
++
++    internal var status: HttpStatusCode = HttpStatusCode.OK
++    internal var contentType: ContentType = ContentType.Text.Plain
++    internal var bodyBytes: ByteArray = ByteArray(0)
++    internal var responded = false
++
++    fun respondText(
++        text: String,
++        contentType: ContentType = ContentType.Text.Plain,
++        status: HttpStatusCode = HttpStatusCode.OK
++    ) {
++        this.status = status
++        this.contentType = contentType
++        this.bodyBytes = text.toByteArray(Charsets.UTF_8)
++        this.responded = true
++    }
++
++    fun <T> respondWith(status: HttpStatusCode, serializer: KSerializer<T>, message: T) {
++        if (message is String) {
++            respondText(message, ContentType.Text.Plain, status)
++        } else {
++            respondText(ApiJson.encodeToString(serializer, message), ContentType.Application.Json, status)
++        }
++    }
++
++    inline fun <reified T> respond(message: T) =
++        respondWith(HttpStatusCode.OK, serializer<T>(), message)
++
++    inline fun <reified T> respond(status: HttpStatusCode, message: T) =
++        respondWith(status, serializer<T>(), message)
++
++    fun <T> receiveWith(serializer: KSerializer<T>): T =
++        ApiJson.decodeFromString(serializer, bodyText)
++
++    inline fun <reified T> receive(): T = receiveWith(serializer<T>())
++}
++
++class RouteContext internal constructor(val call: ApplicationCall)
++
++typealias RouteHandler = suspend RouteContext.() -> Unit
++
++class Routing {
++    internal val routes = HashMap<String, RouteHandler>()
++
++    fun get(path: String, handler: RouteHandler) {
++        routes["GET $path"] = handler
++    }
++
++    fun post(path: String, handler: RouteHandler) {
++        routes["POST $path"] = handler
++    }
++}
++
++fun routing(block: Routing.() -> Unit): Routing = Routing().apply(block)
++
++class MiniHttpServer(
++    private val port: Int,
++    private val routing: Routing,
++    private val scope: CoroutineScope
++) {
++    private var serverSocket: ServerSocket? = null
++    private var acceptThread: Thread? = null
++
++    @Volatile
++    private var running = false
++
++    /** Binds the port and starts accepting connections. Throws if the port is unavailable. */
++    fun start() {
++        val server = ServerSocket()
++        try {
++            server.reuseAddress = true
++            server.bind(InetSocketAddress(port))
++        } catch (e: IOException) {
++            try { server.close() } catch (_: IOException) {}
++            throw e
++        }
++        serverSocket = server
++        running = true
++        acceptThread = Thread({ acceptLoop(server) }, "MiniHttpServer-accept").also {
++            it.isDaemon = true
++            it.start()
++        }
++    }
++
++    fun stop() {
++        running = false
++        try { serverSocket?.close() } catch (_: IOException) {}
++        serverSocket = null
++        acceptThread = null
++    }
++
++    private fun acceptLoop(server: ServerSocket) {
++        while (running) {
++            val socket = try {
++                server.accept()
++            } catch (e: IOException) {
++                if (running) Log.w(TAG, "accept failed: ${e.message}")
++                break
++            }
++            scope.launch(Dispatchers.IO) {
++                try {
++                    handle(socket)
++                } catch (e: Exception) {
++                    Log.w(TAG, "request failed", e)
++                } finally {
++                    try { socket.close() } catch (_: IOException) {}
++                }
++            }
++        }
++    }
++
++    private suspend fun handle(socket: Socket) {
++        socket.soTimeout = 10_000
++        val input = BufferedInputStream(socket.getInputStream())
++        val output = socket.getOutputStream()
++
++        val header = readHeaderBlock(input) ?: return
++        val lines = header.split("\r\n")
++        val requestLine = lines.firstOrNull()?.split(" ") ?: return
++        if (requestLine.size < 2) return
++        val method = requestLine[0].uppercase()
++        val path = requestLine[1].substringBefore('?')
++
++        var contentLength = 0
++        for (i in 1 until lines.size) {
++            val colon = lines[i].indexOf(':')
++            if (colon > 0 && lines[i].substring(0, colon).trim().equals("content-length", ignoreCase = true)) {
++                contentLength = lines[i].substring(colon + 1).trim().toIntOrNull() ?: 0
++            }
++        }
++        if (contentLength > MAX_BODY_BYTES) {
++            writeResponse(output, HttpStatusCode.PayloadTooLarge, ContentType.Text.Plain,
++                "Request body too large".toByteArray(), emptyMap())
++            return
++        }
++        val body = if (contentLength > 0) readBody(input, contentLength) else ""
++
++        val handler = routing.routes["$method $path"]
++        if (handler == null) {
++            writeResponse(output, HttpStatusCode.NotFound, ContentType.Text.Plain,
++                "Not found".toByteArray(), emptyMap())
++            return
++        }
++
++        val call = ApplicationCall(method, path, body)
++        try {
++            handler(RouteContext(call))
++        } catch (e: Exception) {
++            Log.e(TAG, "Handler error for $method $path", e)
++            call.respondText("Internal error: ${e.message}", ContentType.Text.Plain,
++                HttpStatusCode.InternalServerError)
++        }
++        writeResponse(output, call.status, call.contentType, call.bodyBytes, call.response.headers.values)
++    }
++
++    private fun readHeaderBlock(input: InputStream): String? {
++        val buffer = ByteArrayOutputStream()
++        // 0 = nothing, 1 = "\r", 2 = "\r\n", 3 = "\r\n\r", 4 = "\r\n\r\n"
++        var state = 0
++        while (buffer.size() < MAX_HEADER_BYTES) {
++            val b = input.read()
++            if (b == -1) return null
++            buffer.write(b)
++            state = when {
++                b == '\r'.code && (state == 0 || state == 2) -> state + 1
++                b == '\n'.code && (state == 1 || state == 3) -> state + 1
++                b == '\r'.code -> 1
++                else -> 0
++            }
++            if (state == 4) return buffer.toString("ISO-8859-1")
++        }
++        return null
++    }
++
++    private fun readBody(input: InputStream, length: Int): String {
++        val bytes = ByteArray(length)
++        var offset = 0
++        while (offset < length) {
++            val n = input.read(bytes, offset, length - offset)
++            if (n < 0) break
++            offset += n
++        }
++        return String(bytes, 0, offset, Charsets.UTF_8)
++    }
++
++    private fun writeResponse(
++        output: java.io.OutputStream,
++        status: HttpStatusCode,
++        contentType: ContentType,
++        body: ByteArray,
++        extraHeaders: Map<String, String>
++    ) {
++        val head = StringBuilder()
++        head.append("HTTP/1.1 ").append(status.value).append(' ').append(status.description).append("\r\n")
++        head.append("Content-Type: ").append(contentType.value).append("\r\n")
++        head.append("Content-Length: ").append(body.size).append("\r\n")
++        head.append("Connection: close\r\n")
++        for ((name, value) in extraHeaders) {
++            head.append(name).append(": ").append(value).append("\r\n")
++        }
++        head.append("\r\n")
++        output.write(head.toString().toByteArray(Charsets.ISO_8859_1))
++        output.write(body)
++        output.flush()
++    }
++}
+diff --git a/app/src/main/java/com/example/handycam/presentation/main/MainScreen.kt b/app/src/main/java/com/example/handycam/presentation/main/MainScreen.kt
+index 25f0ee1..1523ca9 100644
+--- a/app/src/main/java/com/example/handycam/presentation/main/MainScreen.kt
++++ b/app/src/main/java/com/example/handycam/presentation/main/MainScreen.kt
+@@ -69,7 +69,7 @@ fun MainScreen(
+     val clipboard = LocalClipboard.current
+     val coroutineScope = rememberCoroutineScope()
+     val mediaProjectionManager = remember {
+-        context.getSystemService(MediaProjectionManager::class.java)
++        context.getSystemService(android.content.Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+     }
+ 
+     val host = viewModel.localIp
+diff --git a/app/src/main/java/com/example/handycam/presentation/main/MainViewModel.kt b/app/src/main/java/com/example/handycam/presentation/main/MainViewModel.kt
+index 49a3366..ffab5c7 100644
+--- a/app/src/main/java/com/example/handycam/presentation/main/MainViewModel.kt
++++ b/app/src/main/java/com/example/handycam/presentation/main/MainViewModel.kt
+@@ -106,7 +106,7 @@ class MainViewModel @Inject constructor(
+                     putExtra("mediaProjectionData", mediaProjectionData)
+                 }
+             }
+-            context.startForegroundService(intent)
++            androidx.core.content.ContextCompat.startForegroundService(context, intent)
+         }
+     }
+ 
+@@ -179,7 +179,7 @@ class MainViewModel @Inject constructor(
+             action = HttpServerActions.START
+             putExtra("httpPort", port)
+         }
+-        context.startForegroundService(intent)
++        androidx.core.content.ContextCompat.startForegroundService(context, intent)
+     }
+ 
+     fun stopHttpsServer() {
+diff --git a/app/src/main/res/mipmap-anydpi/ic_launcher.xml b/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml
+similarity index 100%
+rename from app/src/main/res/mipmap-anydpi/ic_launcher.xml
+rename to app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml
+diff --git a/app/src/main/res/mipmap-anydpi/ic_launcher_round.xml b/app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml
+similarity index 100%
+rename from app/src/main/res/mipmap-anydpi/ic_launcher_round.xml
+rename to app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml
+diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+index 754f475..e89fa1a 100644
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+@@ -9,7 +9,7 @@ lifecycleRuntimeKtx = "2.9.4"
+ activityCompose = "1.11.0"
+ composeBom = "2025.10.01"
+ appcompat = "1.7.1"
+-cameraLifecycle = "1.5.1"
++cameraLifecycle = "1.4.2"
+ lifecycleService = "2.9.4"
+ lifecycleViewmodel = "2.9.4"
+ activityKtx = "1.11.0"
+@@ -18,8 +18,7 @@ hilt = "2.60.1"
+ datastore = "1.1.7"
+ coroutines = "1.11.0"
+ navigation = "2.9.5"
+-ktor = "3.3.2"
+-netty = "4.2.17.Final"
++serializationJson = "1.9.0"
+ 
+ [libraries]
+ androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
+@@ -53,11 +52,7 @@ hilt-android = { module = "com.google.dagger:hilt-android", version.ref = "hilt"
+ hilt-compiler = { module = "com.google.dagger:hilt-android-compiler", version.ref = "hilt" }
+ coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "coroutines" }
+ coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }
+-ktor-server-core = { module = "io.ktor:ktor-server-core", version.ref = "ktor" }
+-ktor-server-netty = { module = "io.ktor:ktor-server-netty", version.ref = "ktor" }
+-ktor-server-content-negotiation = { module = "io.ktor:ktor-server-content-negotiation", version.ref = "ktor" }
+-ktor-serialization-kotlinx-json = { module = "io.ktor:ktor-serialization-kotlinx-json", version.ref = "ktor" }
+-netty-bom = { module = "io.netty:netty-bom", version.ref = "netty" }
++kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "serializationJson" }
+ 
+ [plugins]
+ android-application = { id = "com.android.application", version.ref = "agp" }
