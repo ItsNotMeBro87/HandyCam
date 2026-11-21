@@ -16,15 +16,12 @@ import com.example.handycam.data.model.api.CameraListItem
 import com.example.handycam.data.model.api.CameraStatusResponse
 import com.example.handycam.data.model.api.ServerInfo
 import com.example.handycam.data.model.api.ServerStatus
-import io.ktor.server.engine.*
-import io.ktor.server.netty.*
-import io.ktor.server.application.*
-import io.ktor.server.response.*
-import io.ktor.server.routing.*
-import io.ktor.http.*
-import io.ktor.serialization.kotlinx.json.*
-import io.ktor.server.plugins.contentnegotiation.*
-import io.ktor.server.request.*
+import com.example.handycam.http.ContentType
+import com.example.handycam.http.HttpStatusCode
+import com.example.handycam.http.MiniHttpServer
+import com.example.handycam.http.Routing
+import com.example.handycam.http.routing
+import androidx.core.app.ServiceCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import android.hardware.camera2.CameraCharacteristics
@@ -37,13 +34,14 @@ private const val CHANNEL_ID = "ktor_https_server"
 private const val NOTIF_ID = 2001
 
 /**
- * Foreground service that runs a Ktor HTTP server.
- * The server runs on a specified port.
+ * Foreground service that runs the HTTP control server (web UI + REST API).
+ * The server runs on a specified port. It uses the small built-in [MiniHttpServer]
+ * instead of Ktor/Netty so it works on Android 5.0 and newer.
  */
 @dagger.hilt.android.AndroidEntryPoint
 class KtorHttpServerService : LifecycleService() {
     
-    private var server: EmbeddedServer<NettyApplicationEngine, NettyApplicationEngine.Configuration>? = null
+    private var server: MiniHttpServer? = null
     private var httpPort = 8080
     private var isRunning = false
     @javax.inject.Inject lateinit var streamStateHolder: com.example.handycam.service.StreamStateHolder
@@ -69,7 +67,7 @@ class KtorHttpServerService : LifecycleService() {
             }
             HttpServerActions.STOP -> {
                 stopHttpServer()
-                stopForeground(STOP_FOREGROUND_REMOVE)
+                ServiceCompat.stopForeground(this@KtorHttpServerService, ServiceCompat.STOP_FOREGROUND_REMOVE)
                 stopSelf()
             }
         }
@@ -81,6 +79,11 @@ class KtorHttpServerService : LifecycleService() {
         super.onBind(intent)
         return null
     }
+
+    /** The launcher foreground vector uses a gradient, which only renders on API 24+. */
+    private fun smallIconRes(): Int =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) R.drawable.ic_launcher_foreground
+        else R.drawable.ic_flash
 
     private fun createNotificationChannel() {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -120,9 +123,9 @@ class KtorHttpServerService : LifecycleService() {
         NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("HTTP Server")
             .setContentText(text)
-            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setSmallIcon(smallIconRes())
             .setContentIntent(openPending)
-            .addAction(R.drawable.ic_launcher_foreground, "Stop", stopPending)
+            .addAction(smallIconRes(), "Stop", stopPending)
             .setOngoing(true)
             .build()
     }
@@ -137,9 +140,7 @@ class KtorHttpServerService : LifecycleService() {
                 // startTime = System.currentTimeMillis()
 
                 // Run a plain HTTP server (no TLS/keystore) for local control
-                server = embeddedServer(Netty, port = httpPort) {
-                    configureRouting()
-                }.apply { start(wait = false) }
+                server = MiniHttpServer(httpPort, buildRouting(), lifecycleScope).also { it.start() }
 
                 isRunning = true
 
@@ -168,12 +169,8 @@ class KtorHttpServerService : LifecycleService() {
         }
     }
 
-    private fun Application.configureRouting() {
-        install(ContentNegotiation) {
-            json()
-        }
-        
-        routing {
+    private fun buildRouting(): Routing {
+        return routing {
             get("/") {
                 call.respondText(
                     homePageHtml,
@@ -307,7 +304,7 @@ class KtorHttpServerService : LifecycleService() {
                         val notif = NotificationCompat.Builder(this@KtorHttpServerService, notifChannelId)
                             .setContentTitle("HandyCam: Action Required")
                             .setContentText("Tap to open app and start streaming")
-                            .setSmallIcon(R.drawable.ic_launcher_foreground)
+                            .setSmallIcon(smallIconRes())
                             .setPriority(NotificationCompat.PRIORITY_HIGH)
                             .setCategory(NotificationCompat.CATEGORY_CALL)
                             .setContentIntent(openPending)
@@ -630,7 +627,7 @@ class KtorHttpServerService : LifecycleService() {
 
     private fun stopHttpServer() {
         try {
-            server?.stop(1000, 2000)
+            server?.stop()
             server = null
             isRunning = false
             Log.i(TAG, "HTTP Server stopped")

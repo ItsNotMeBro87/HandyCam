@@ -17,6 +17,8 @@ object PhysicalLens {
     }
 
     fun valid(manager: CameraManager, key: String): Boolean = try {
+        // Physical (multi-camera) lenses only exist on Android 9+.
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.P) return false
         val pair = parse(key) ?: return false
         pair.first in manager.cameraIdList &&
             pair.second in manager.getCameraCharacteristics(pair.first).physicalCameraIds

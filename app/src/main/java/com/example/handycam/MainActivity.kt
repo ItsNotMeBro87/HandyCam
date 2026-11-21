@@ -99,7 +99,7 @@ class MainActivity : ComponentActivity() {
             putExtra("avcBitrate", mainViewModel.streamStateHolder.avcBitrate.value)
         }
         try {
-            startForegroundService(intent)
+            androidx.core.content.ContextCompat.startForegroundService(this, intent)
             Log.i(TAG, "Started deferred remote stream request on resume")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start deferred remote stream", e)

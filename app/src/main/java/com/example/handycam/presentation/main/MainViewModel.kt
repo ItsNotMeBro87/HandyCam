@@ -106,7 +106,7 @@ class MainViewModel @Inject constructor(
                     putExtra("mediaProjectionData", mediaProjectionData)
                 }
             }
-            context.startForegroundService(intent)
+            androidx.core.content.ContextCompat.startForegroundService(context, intent)
         }
     }
 
@@ -179,7 +179,7 @@ class MainViewModel @Inject constructor(
             action = HttpServerActions.START
             putExtra("httpPort", port)
         }
-        context.startForegroundService(intent)
+        androidx.core.content.ContextCompat.startForegroundService(context, intent)
     }
 
     fun stopHttpsServer() {

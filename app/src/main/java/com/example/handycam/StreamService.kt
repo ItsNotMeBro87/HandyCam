@@ -57,7 +57,7 @@ import android.media.AudioRecord
 import android.media.AudioFormat
 import android.media.MediaRecorder
 import android.media.AudioAttributes
-import android.media.AudioPlaybackCaptureConfiguration
+import androidx.core.app.ServiceCompat
 private const val TAG = "StreamService"
 private const val CHANNEL_ID = "handycam_stream"
 private const val NOTIF_ID = 1001
@@ -108,6 +108,9 @@ class StreamService : LifecycleService() {
     // Must be used as-is when rebuilding CaptureRequests — Camera2 throws if
     // the set of targets doesn't match the session configuration.
     private var sessionSurfaces: List<Surface> = emptyList()
+    // Old/LEGACY Camera2 devices often reject a 3rd output stream. When the session with the
+    // extra YUV ImageReader fails, we retry once without it.
+    private var skipImageReaderConsumer = false
     // CameraX fields for MJPEG path so we can rebind while running
     private var cameraProvider: ProcessCameraProvider? = null
     private var analysisUseCase: ImageAnalysis? = null
@@ -307,7 +310,7 @@ class StreamService : LifecycleService() {
                     Log.e(TAG, "Unable to start streaming", e)
                     stopStreaming()
                     android.widget.Toast.makeText(this, "Unable to start streaming. Check permissions and settings.", android.widget.Toast.LENGTH_LONG).show()
-                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    ServiceCompat.stopForeground(this@StreamService, ServiceCompat.STOP_FOREGROUND_REMOVE)
                     stopSelf()
                     return START_NOT_STICKY
                 }
@@ -342,7 +345,7 @@ class StreamService : LifecycleService() {
                 streamStateHolder.setStreaming(false)
                 unregisterMdns()
                 stopStreaming()
-                stopForeground(STOP_FOREGROUND_REMOVE)
+                ServiceCompat.stopForeground(this@StreamService, ServiceCompat.STOP_FOREGROUND_REMOVE)
                 stopSelf()
             }
             else -> {
@@ -658,6 +661,7 @@ class StreamService : LifecycleService() {
         targetFps = fps
         useAvc = useAvcFlag
         highSpeedCameraSession = false
+        skipImageReaderConsumer = false
         useScreenCapture = screenCapture
 
         if (useScreenCapture) {
@@ -879,7 +883,7 @@ class StreamService : LifecycleService() {
     // ── Screen capture helpers ──────────────────────────────────────────────
 
     private fun startScreenCaptureMjpeg(resultCode: Int, data: Intent, w: Int, h: Int) {
-        val mgr = getSystemService(MediaProjectionManager::class.java)
+        val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         mediaProjection = mgr.getMediaProjection(resultCode, data)
 
         val density = resources.displayMetrics.densityDpi
@@ -944,7 +948,7 @@ class StreamService : LifecycleService() {
     }
 
     private fun startScreenCaptureAvc(resultCode: Int, data: Intent) {
-        val mgr = getSystemService(MediaProjectionManager::class.java)
+        val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         mediaProjection = mgr.getMediaProjection(resultCode, data)
 
         val density = resources.displayMetrics.densityDpi
@@ -1007,7 +1011,7 @@ class StreamService : LifecycleService() {
                 setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT2020)
                 setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
                 setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_HLG)
-                setFeatureEnabled(MediaCodecInfo.CodecCapabilities.FEATURE_HdrEditing, true)
+                ApiCompat.enableHdrEditing(this)
             }
             try {
                 // CBR keeps bitrate predictable so the frame queue doesn't burst-overflow
@@ -1267,7 +1271,7 @@ class StreamService : LifecycleService() {
     private fun startAudio() {
         if (audioRunning) return
         try {
-            val deviceAudio = useScreenCapture && mediaProjection != null
+            val deviceAudio = useScreenCapture && mediaProjection != null && ApiCompat.supportsPlaybackCapture
             val channelConfig = if (deviceAudio) AudioFormat.CHANNEL_IN_STEREO else AudioFormat.CHANNEL_IN_MONO
             val channelCount = if (deviceAudio) 2 else AUDIO_CHANNELS
             val minBuf = AudioRecord.getMinBufferSize(
@@ -1277,22 +1281,9 @@ class StreamService : LifecycleService() {
             )
             val bufSize = maxOf(minBuf, 4096)
             audioRecord = if (deviceAudio) {
-                val config = AudioPlaybackCaptureConfiguration.Builder(mediaProjection!!)
-                    .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-                    .addMatchingUsage(AudioAttributes.USAGE_GAME)
-                    .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
-                    .build()
-                AudioRecord.Builder()
-                    .setAudioPlaybackCaptureConfig(config)
-                    .setAudioFormat(
-                        AudioFormat.Builder()
-                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                            .setSampleRate(AUDIO_SAMPLE_RATE)
-                            .setChannelMask(channelConfig)
-                            .build()
-                    )
-                    .setBufferSizeInBytes(bufSize)
-                    .build()
+                ApiCompat.createPlaybackCaptureRecord(
+                    mediaProjection!!, AUDIO_SAMPLE_RATE, channelConfig, bufSize
+                )
             } else {
                 AudioRecord(
                     MediaRecorder.AudioSource.MIC,
@@ -1450,8 +1441,7 @@ class StreamService : LifecycleService() {
                 throw IllegalStateException("HDR requires Android 13")
             }
             val chars = cameraManager!!.getCameraCharacteristics(PhysicalLens.parse(selectedCamera)?.second ?: camId)
-            val profiles = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES)
-            check(profiles?.supportedProfiles?.contains(android.hardware.camera2.params.DynamicRangeProfiles.HLG10) == true) { "Camera does not support HLG10" }
+            check(ApiCompat.supportsHlg10(chars)) { "Camera does not support HLG10" }
         }
 
         // determine a supported output size for the camera for encoder surface
@@ -1536,7 +1526,16 @@ class StreamService : LifecycleService() {
                         // create an ImageReader as an additional consumer so some devices
                         // will happily start streaming into the encoder surface
                         val targets = mutableListOf(surface)
-                        if (!highSpeedCameraSession && !useHdr) {
+                        val legacyHardware = try {
+                            cameraManager?.getCameraCharacteristics(camId)
+                                ?.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL) ==
+                                CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_LEGACY
+                        } catch (_: Exception) {
+                            false
+                        }
+                        val addImageReader = !highSpeedCameraSession && !useHdr &&
+                            !skipImageReaderConsumer && !legacyHardware
+                        if (addImageReader) {
                         val ir = imageReader ?: android.media.ImageReader.newInstance(
                             chosenWidth.takeIf { it>0 } ?: 1280,
                             chosenHeight.takeIf { it>0 } ?: 720,
@@ -1584,22 +1583,36 @@ class StreamService : LifecycleService() {
 
                             override fun onConfigureFailed(session: CameraCaptureSession) {
                                 Log.e(TAG, "Camera2 session configuration failed")
+                                if (addImageReader && running) {
+                                    // Older cameras often cannot run 3 streams at once: retry
+                                    // once with only the encoder (+ preview) surfaces.
+                                    Log.w(TAG, "Retrying Camera2 session without the extra ImageReader")
+                                    skipImageReaderConsumer = true
+                                    lifecycleScope.launch(Dispatchers.Main) {
+                                        try {
+                                            stopCamera2(releaseEncoderSurface = false)
+                                            startCamera2ToEncoder(requestedWidth, requestedHeight, targetFps)
+                                        } catch (e: Exception) {
+                                            Log.e(TAG, "Retry without ImageReader failed", e)
+                                            failCamera2Switch("Selected lens does not support this stream configuration")
+                                        }
+                                    }
+                                    return
+                                }
                                 failCamera2Switch("Selected lens does not support this stream configuration")
                             }
                         }
-                        val sessionConfig = android.hardware.camera2.params.SessionConfiguration(
-                            if (highSpeedCameraSession) android.hardware.camera2.params.SessionConfiguration.SESSION_HIGH_SPEED
-                            else android.hardware.camera2.params.SessionConfiguration.SESSION_REGULAR,
-                            targets.map { physicalOutput(it) },
-                            java.util.concurrent.Executor { cmd -> cameraHandler?.post(cmd) },
-                            sessionCb
-                        )
-                        highFrameRateRange(camera.id)?.let { range ->
+                        val sessionParams = highFrameRateRange(camera.id)?.let { range ->
                             val parameters = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
                             parameters.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range)
-                            sessionConfig.setSessionParameters(parameters.build())
+                            parameters.build()
                         }
-                        camera.createCaptureSession(sessionConfig)
+                        ApiCompat.createCaptureSession(
+                            camera, targets, highSpeedCameraSession,
+                            PhysicalLens.parse(selectedCamera)?.second,
+                            if (useHdr) encoderInputSurface else null,
+                            sessionParams, sessionCb, cameraHandler
+                        )
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to create capture request/session", e)
                         failCamera2Switch("Failed to configure selected lens")
@@ -1678,11 +1691,7 @@ class StreamService : LifecycleService() {
     }
 
     private fun submitRepeating(session: CameraCaptureSession, request: CaptureRequest) {
-        if (session is android.hardware.camera2.CameraConstrainedHighSpeedCaptureSession) {
-            session.setRepeatingBurst(session.createHighSpeedRequestList(request), null, cameraHandler)
-        } else {
-            session.setRepeatingRequest(request, null, cameraHandler)
-        }
+        ApiCompat.submitRepeating(session, request, cameraHandler)
     }
 
     private fun setInitialLensZoom(selection: String, avc: Boolean) {
@@ -1721,7 +1730,16 @@ class StreamService : LifecycleService() {
             Log.i(TAG, "Building selector for camera $cameraId with facing=$targetFacing, focal lengths=$targetFocalLengths")
             
             val selectorBuilder = CameraSelector.Builder()
-            if (physicalId != null) selectorBuilder.setPhysicalCameraId(physicalId)
+            if (physicalId != null) {
+                // Not present in every CameraX release, so look it up at runtime.
+                try {
+                    CameraSelector.Builder::class.java
+                        .getMethod("setPhysicalCameraId", String::class.java)
+                        .invoke(selectorBuilder, physicalId)
+                } catch (e: Exception) {
+                    Log.w(TAG, "CameraX cannot select physical camera $physicalId", e)
+                }
+            }
             
             // First, require the correct facing direction
             when (targetFacing) {
@@ -1931,14 +1949,6 @@ class StreamService : LifecycleService() {
         }
     }
     
-    private fun physicalOutput(surface: Surface): android.hardware.camera2.params.OutputConfiguration =
-        android.hardware.camera2.params.OutputConfiguration(surface).apply {
-            PhysicalLens.parse(selectedCamera)?.second?.let { setPhysicalCameraId(it) }
-            if (useHdr && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && surface == encoderInputSurface) {
-                setDynamicRangeProfile(android.hardware.camera2.params.DynamicRangeProfiles.HLG10)
-            }
-        }
-
     private fun stopAfterStreamFailure(message: String) {
         lifecycleScope.launch(Dispatchers.Main) {
             if (!running) return@launch
@@ -1946,7 +1956,7 @@ class StreamService : LifecycleService() {
             unregisterMdns()
             stopStreaming()
             android.widget.Toast.makeText(this@StreamService, message, android.widget.Toast.LENGTH_LONG).show()
-            stopForeground(STOP_FOREGROUND_REMOVE)
+            ServiceCompat.stopForeground(this@StreamService, ServiceCompat.STOP_FOREGROUND_REMOVE)
             stopSelf()
         }
     }
@@ -2011,19 +2021,17 @@ class StreamService : LifecycleService() {
                     Log.e(TAG, "Camera2 session reconfigure failed")
                 }
             }
-            val reconfigSessionConfig = android.hardware.camera2.params.SessionConfiguration(
-                if (highSpeedCameraSession) android.hardware.camera2.params.SessionConfiguration.SESSION_HIGH_SPEED
-                else android.hardware.camera2.params.SessionConfiguration.SESSION_REGULAR,
-                surfaces.map { physicalOutput(it) },
-                java.util.concurrent.Executor { cmd -> cameraHandler?.post(cmd) },
-                sessionCb2
-            )
-            highFrameRateRange(camera.id)?.let { range ->
+            val reconfigParams = highFrameRateRange(camera.id)?.let { range ->
                 val parameters = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
                 parameters.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range)
-                reconfigSessionConfig.setSessionParameters(parameters.build())
+                parameters.build()
             }
-            camera.createCaptureSession(reconfigSessionConfig)
+            ApiCompat.createCaptureSession(
+                camera, surfaces, highSpeedCameraSession,
+                PhysicalLens.parse(selectedCamera)?.second,
+                null, // HDR never reaches this path (reconfigure returns early for HDR)
+                reconfigParams, sessionCb2, cameraHandler
+            )
         } catch (e: Exception) {
             Log.e(TAG, "Error reconfiguring Camera2 session", e)
         }

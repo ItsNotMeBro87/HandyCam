@@ -69,7 +69,7 @@ fun MainScreen(
     val clipboard = LocalClipboard.current
     val coroutineScope = rememberCoroutineScope()
     val mediaProjectionManager = remember {
-        context.getSystemService(MediaProjectionManager::class.java)
+        context.getSystemService(android.content.Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
     }
 
     val host = viewModel.localIp

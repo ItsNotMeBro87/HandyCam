@@ -41,6 +41,12 @@ Android APKs are published to every release, and [Obtainium](https://obtainium.i
 
 
 ## Compatibility
+**This fork runs on Android 5.0 (API 21) and newer.** Notes for older phones:
+- Streaming the screen with *device audio* needs Android 10+. On older versions the microphone is streamed instead.
+- HDR needs Android 13+. Multi-lens/physical-camera selection needs Android 9+. High frame rates (>60 fps) need Android 6+.
+- Some Android 5/6 phones only have "LEGACY" Camera2 support. If H.264 gives an error, try **MJPEG** at a lower resolution (e.g. 640x480 / 720p).
+- The HTTP control server is a small built-in server (no Ktor/Netty) so it works on old Android versions.
+
 HDR requires Android 13 or newer, an HLG10-capable camera, and a compatible HEVC Main10 encoder at the chosen settings. Camera preview and screen capture are unavailable in HDR mode.
 > [!IMPORTANT]
 > The FPS selection is an approximation and can be wrong, especially when using custom resolutions!
@@ -56,6 +62,17 @@ Please report and device incompatibilities in the [Discussions](https://github.c
 - Squash Bugs
 
 ## Build Instructions
+### Without Android Studio (GitHub Actions)
+1. Push this repo to your GitHub fork.
+2. Open the **Actions** tab, pick **Build APK**, and click **Run workflow** (it also runs on every push).
+3. When it finishes, open the run and download **HandyCam-APK** from *Artifacts* (a zip containing the `.apk`).
+4. Optional but recommended: add the repository secrets `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`,
+   `ANDROID_KEY_ALIAS` and `ANDROID_KEY_PASSWORD` so every build is signed with your own key and can be installed
+   over the previous one. Without them a throw-away key is used (uninstall the old build before installing a new one).
+
+The original Nightly/Release/CodeQL/Appknox workflows need the upstream project's secrets; you can disable them in your fork.
+
+### With Android Studio / local Gradle
 The easiest way to get going is to download and install [Android Studio](https://developer.android.com/studio) and use its inbuilt Version Control to clone/fork the HandyCam Repository. This should just work out of the box. Alternatively, you can use an IDE like VSCode and download the Android and JAVA JDKs separately. Then you need to point your system to them, for example:
 
 ```
